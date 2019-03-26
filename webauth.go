@@ -152,7 +152,10 @@ func (c Authenticator) Middleware(h http.Handler) http.Handler {
 			return
 		}
 		if !verified {
-			c.redirect(w, r)
+			// we know who you are, but for some reason you dont have access.
+			// stop the redirect loop here to prevent redirect chaos.
+			code := http.StatusForbidden
+			http.Error(w, http.StatusText(code), code)
 			return
 		}
 
@@ -201,6 +204,20 @@ func (c Authenticator) callbackHandler(w http.ResponseWriter, r *http.Request) {
 		c.cfg.Logger.Log("message", "id_token was not a string",
 			"error", "unexpectected type: "+fmt.Sprintf("%T", idI))
 		c.redirect(w, r)
+		return
+	}
+
+	// they have authenticated, see if we can authorize them
+	// via the given verifyFunc
+	verified, err := c.verifier.Verify(r.Context(), id)
+	if err != nil {
+		c.redirect(w, r)
+		return
+	}
+	if !verified {
+		// stop here here to prevent redirect chaos.
+		code := http.StatusForbidden
+		http.Error(w, http.StatusText(code), code)
 		return
 	}
 
