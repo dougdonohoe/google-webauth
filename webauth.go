@@ -59,20 +59,34 @@ type (
 		// Google OAuth flow.
 		AuthConfig *oauth2.Config
 
+		// how long login is valid for (cookie setting).  If not set, defaults to 1 day.
+		LoginValidMinutes int
+
 		// HeaderExceptions can optionally be included. Any requests that include any of
-		// the headers included will skip all Authenticator.Middlware checks and no
+		// the headers included will skip all Authenticator.Middleware checks and no
 		// claims information will be added to the context.
 		// This can be useful for unspoofable headers like Google App Engine's
 		// "X-AppEngine-*" headers for Google Task Queues.
 		HeaderExceptions []string
 
+		// Allow any custom exceptions based on the request.  For example, looking for
+		// specific URIs.  Return true if should be allowed.  If false is returned,
+		// normal cookie-based authentication happens.
+		CustomExceptionsFunc func(context.Context, *http.Request) bool
+
 		// IDConfig will be used to verify the Google Identity JWS when it is inbound
 		// in the HTTP cookie.
 		IDConfig gcp.IdentityConfig
+
 		// IDVerifyFunc allows developers to add their own verification on the user
 		// claims. For example, one could enable access for anyone with an email domain
 		// of "@example.com".
 		IDVerifyFunc func(context.Context, gcp.IdentityClaimSet) bool
+
+		// Redirect path on auth failure.  This path is always allowed to avoid
+		// redirect loops.  However - make sure any resources this path uses
+		// (e.g., css/js) are either in-line or allowed via CustomExceptionsFunc
+		AuthFailurePath string
 
 		// Logger will be used to log any errors encountered during the auth flow.
 		Logger log.Logger
@@ -110,18 +124,6 @@ func New(ctx context.Context, cfg Config) (Authenticator, error) {
 	}, nil
 }
 
-// LogOut can be used to clear an existing session. It will add an HTTP cookie with a -1
-// "MaxAge" to the response to remove the cookie from the logged in user's browser.
-func (c Authenticator) LogOut(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{
-		Name:    c.cfg.CookieName,
-		Domain:  c.cookieDomain,
-		Value:   "",
-		MaxAge:  -1,
-		Expires: time.Unix(0, 0),
-	})
-}
-
 // Middleware will handle login redirects, OAuth callbacks, header exceptions, verifying
 // inbound Google ID JWS' within HTTP cookies and, if the user passes all checks, it will
 // add the user claims to the inbound request context.
@@ -129,6 +131,12 @@ func (c Authenticator) Middleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == c.callbackPath {
 			c.callbackHandler(w, r)
+			return
+		}
+
+		// always allow auth failure path
+		if c.cfg.AuthFailurePath != "" && r.RequestURI == c.cfg.AuthFailurePath {
+			h.ServeHTTP(w, r)
 			return
 		}
 
@@ -141,6 +149,12 @@ func (c Authenticator) Middleware(h http.Handler) http.Handler {
 			}
 		}
 
+		// if this is a custom exception, let through
+		if c.cfg.CustomExceptionsFunc != nil && c.cfg.CustomExceptionsFunc(r.Context(), r) {
+			h.ServeHTTP(w, r)
+			return
+		}
+
 		// ***all other endpoints must have a cookie***
 
 		ck, err := r.Cookie(c.cfg.CookieName)
@@ -149,16 +163,7 @@ func (c Authenticator) Middleware(h http.Handler) http.Handler {
 			return
 		}
 
-		verified, err := c.verifier.Verify(r.Context(), ck.Value)
-		if err != nil {
-			c.redirect(w, r)
-			return
-		}
-		if !verified {
-			// we know who you are, but for some reason you dont have access.
-			// stop the redirect loop here to prevent redirect chaos.
-			code := http.StatusForbidden
-			http.Error(w, http.StatusText(code), code)
+		if okay := c.verify(w, r, ck.Value); !okay {
 			return
 		}
 
@@ -172,6 +177,30 @@ func (c Authenticator) Middleware(h http.Handler) http.Handler {
 		r = r.WithContext(context.WithValue(r.Context(), claimsKey, claims))
 		h.ServeHTTP(w, r)
 	})
+}
+
+// Verify id using verify function.  Redirect to AuthFailurePath if provided, otherwise
+// respond with Status Forbidden.  Return true if ok to proceed.
+func (c Authenticator) verify(w http.ResponseWriter, r *http.Request, id string) bool {
+	verified, err := c.verifier.Verify(r.Context(), id)
+	if err != nil {
+		c.redirect(w, r)
+		return false
+	}
+	// we know who you are, but for some reason you dont have access.
+	if !verified {
+		// if auth failure redirect path exists, send there
+		if c.cfg.AuthFailurePath != "" {
+			http.Redirect(w, r, c.cfg.AuthFailurePath, http.StatusSeeOther)
+			return false
+		} else {
+			// stop the redirect loop here to prevent redirect chaos.
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return false
+		}
+	}
+
+	return true
 }
 
 func (c Authenticator) callbackHandler(w http.ResponseWriter, r *http.Request) {
@@ -205,41 +234,62 @@ func (c Authenticator) callbackHandler(w http.ResponseWriter, r *http.Request) {
 	id, ok := idI.(string)
 	if !ok {
 		c.cfg.Logger.Log("message", "id_token was not a string",
-			"error", "unexpectected type: "+fmt.Sprintf("%T", idI))
+			"error", "unexpected type: "+fmt.Sprintf("%T", idI))
 		c.redirect(w, r)
 		return
 	}
 
 	// they have authenticated, see if we can authorize them
 	// via the given verifyFunc
-	verified, err := c.verifier.Verify(r.Context(), id)
-	if err != nil {
-		c.redirect(w, r)
-		return
-	}
-	if !verified {
-		// stop here here to prevent redirect chaos.
-		code := http.StatusForbidden
-		http.Error(w, http.StatusText(code), code)
+	if okay := c.verify(w, r, id); !okay {
 		return
 	}
 
+	// TODO: figure out proper way to do refresh tokens
 	// grab claims so we can use the expiration on our cookie
-	claims, err := decodeClaims(id)
-	if err != nil {
-		c.cfg.Logger.Log("error", err, "message", "unable to decode token")
-		c.redirect(w, r)
-		return
-	}
+	//claims, err := decodeClaims(id)
+	//if err != nil {
+	//	c.cfg.Logger.Log("error", err, "message", "unable to decode token")
+	//	c.redirect(w, r)
+	//	return
+	//}
 
+	// we set a cookie which expires at end of desired login period
+	expire := 60 * 24 // default 1 day
+	if c.cfg.LoginValidMinutes > 0 {
+		expire = c.cfg.LoginValidMinutes
+	}
+	expireTime := time.Now().UTC().Add(time.Duration(expire) * time.Minute)
+
+	// TODO: remove when all sorted out
+	//fmt.Printf("Claims expire:  %v (from %d)\n", time.Unix(claims.Exp, 0).UTC(), claims.Exp)
+	//fmt.Printf("Desired expire: %v\n", expireTime)
+
+	http.SetCookie(w, &http.Cookie{
+		Name:   c.cfg.CookieName,
+		Secure: c.secureCookie,
+		Value:  id,
+		Domain: c.cookieDomain,
+		// TODO: Default is 1 hour, which is too short, so we are improvising
+		//Expires: time.Unix(claims.Exp, 0),
+		Expires: expireTime,
+		Path:    "/",
+	})
+	http.Redirect(w, r, uri, http.StatusTemporaryRedirect)
+}
+
+// LogOut can be used to clear an existing session. It will add an HTTP cookie with a -1
+// "MaxAge" to the response to remove the cookie from the logged in user's browser.
+func (c Authenticator) LogOut(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name:    c.cfg.CookieName,
 		Secure:  c.secureCookie,
-		Value:   id,
+		Value:   "",
 		Domain:  c.cookieDomain,
-		Expires: time.Unix(claims.Exp, 0),
+		Expires: time.Unix(0, 0),
+		Path:    "/", // needed to ensure cookie is removed
+		MaxAge:  -1,
 	})
-	http.Redirect(w, r, uri, http.StatusTemporaryRedirect)
 }
 
 func (c Authenticator) verifyState(ctx context.Context, state string) (string, bool) {
@@ -278,7 +328,11 @@ func (c Authenticator) verifyState(ctx context.Context, state string) (string, b
 }
 
 func (s stateData) verifiedURI() (string, bool) {
-	return s.URI, time.Now().Before(s.Expiry)
+	// TODO: figure out proper way to do refresh tokens
+	// return s.URI, time.Now().Before(s.Expiry)
+
+	// for now, just always allow (use cookie expiration to force login
+	return s.URI, true
 }
 
 type stateData struct {
